@@ -1,77 +1,53 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Quartz;
-using Robust.Cdn.Helpers;
 using Robust.Cdn.Config;
-using System.Security.Cryptography;
+using Robust.Cdn.Helpers;
 
 namespace Robust.Cdn.Jobs;
-
-/// <summary>
-/// Updates the cached server manifest for a fork.
-/// </summary>
-public sealed class UpdateForkManifestJob(
+public sealed class UpdateRobustManifestJob(
     ManifestDatabase database,
     BaseUrlManager baseUrlManager,
     BuildDirectoryManager buildDirectoryManager,
-    IOptions<ManifestOptions> manifestOptions,
-    ISchedulerFactory schedulerFactory,
-    ILogger<MakeNewManifestVersionsAvailableJob> logger) : IJob
+    IOptions<RobustOptions> robustOptions,
+    ILogger<UpdateRobustManifestJob> logger) : IJob
 {
     private static readonly JsonSerializerOptions ManifestCacheContext = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
-
-    public static readonly JobKey Key = new(nameof(UpdateForkManifestJob));
-
-    public const string KeyForkName = "ForkName";
-    public const string KeyNotifyUpdate = "NotifyUpdate";
-
-    public static JobDataMap Data(string fork, bool notifyUpdate = false) => new()
+    public static readonly JobKey Key = new(nameof(UpdateRobustManifestJob));
+    public const string ForkName = "robust";
+    public Task Execute(IJobExecutionContext context)
     {
-        { KeyForkName, fork },
-        { KeyNotifyUpdate, notifyUpdate }
-    };
-
-    public async Task Execute(IJobExecutionContext context)
-    {
-        var fork = context.MergedJobDataMap.GetString(KeyForkName) ?? throw new InvalidDataException();
-        var notifyUpdate = context.MergedJobDataMap.GetBooleanValue(KeyNotifyUpdate);
+        _ = context;
 
         var forkId = database.Context.Forks
-            .Where(f => f.Name == fork)
+            .Where(f => f.Name == ForkName)
             .Select(f => f.Id)
             .First();
 
-        logger.LogInformation("Updating manifest cache for fork {Fork}", fork);
+        logger.LogInformation("Updating manifest cache for robust");
 
-        UpdateServerManifestCache(fork, forkId);
-
-        if (notifyUpdate)
-            await QueueNotifyWatchdogUpdate(fork);
-    }
-
-    private void UpdateServerManifestCache(string fork, int forkId)
-    {
-        var data = CollectManifestData(fork, forkId);
+        var data = CollectManifestData(forkId);
         var bytes = JsonSerializer.SerializeToUtf8Bytes(data, ManifestCacheContext);
 
-        var forkEntity = database.Context.Forks.Find(forkId);
-        if (forkEntity is null)
+        var fork = database.Context.Forks.Find(forkId);
+        if (fork is null)
             throw new InvalidOperationException($"Fork with id {forkId} not found.");
 
-        forkEntity.ServerManifestCache = bytes;
+        fork.ServerManifestCache = bytes;
         database.Context.SaveChanges();
+        return Task.CompletedTask;
     }
 
-    private ManifestData CollectManifestData(string fork, int forkId)
+    private ManifestData CollectManifestData(int forkId)
     {
+        var opts = robustOptions.Value;
         var data = new ManifestData { Builds = new Dictionary<string, ManifestBuildData>() };
-        var forkConfig = manifestOptions.Value.Forks[fork];
-        var clientBase = GetClientZipBaseName(forkConfig.ClientZipName);
 
         var versions = database.Context.ForkVersions
             .AsNoTracking()
@@ -81,16 +57,17 @@ public sealed class UpdateForkManifestJob(
 
         foreach (var version in versions)
         {
-            var platforms = forkConfig.IncludeClientPlatformsInManifest
-                ? CollectClientPlatforms(fork, version.Name, clientBase, version.ClientFileName, version.Sha256)
+            var platforms = opts.IncludeClientPlatformsInManifest
+                ? CollectClientPlatforms(version.Name, opts.ClientZipName, version.ClientFileName, version.Sha256)
                 : null;
+
             var buildData = new ManifestBuildData
             {
                 Time = DateTime.SpecifyKind(version.PublishedTime, DateTimeKind.Utc),
                 Client = new ManifestArtifact
                 {
                     Url = baseUrlManager.MakeBuildInfoUrl(
-                        $"fork/{fork}/version/{version.Name}/file/{version.ClientFileName}"),
+                        $"robust/version/{version.Name}/file/{version.ClientFileName}"),
                     Sha256 = Convert.ToHexString(version.Sha256)
                 },
                 Platforms = platforms is { Count: > 0 } ? platforms : null,
@@ -107,7 +84,7 @@ public sealed class UpdateForkManifestJob(
             {
                 buildData.Server.Add(server.Platform, new ManifestArtifact
                 {
-                    Url = baseUrlManager.MakeBuildInfoUrl($"fork/{fork}/version/{version.Name}/file/{server.FileName}"),
+                    Url = baseUrlManager.MakeBuildInfoUrl($"robust/version/{version.Name}/file/{server.FileName}"),
                     Sha256 = Convert.ToHexString(server.Sha256),
                     Size = server.FileSize
                 });
@@ -120,16 +97,17 @@ public sealed class UpdateForkManifestJob(
     }
 
     private Dictionary<string, ManifestArtifact> CollectClientPlatforms(
-        string fork,
         string version,
-        string clientBase,
+        string clientZipName,
         string primaryClientFileName,
         byte[] primaryClientSha256)
     {
         var result = new Dictionary<string, ManifestArtifact>(StringComparer.Ordinal);
-        var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, version);
+        var versionDir = buildDirectoryManager.GetRobustBuildVersionPath(version);
         if (!Directory.Exists(versionDir))
             return result;
+
+        var clientBase = GetClientZipBaseName(clientZipName);
         foreach (var filePath in Directory.EnumerateFiles(versionDir, clientBase + "*.zip"))
         {
             var fileName = Path.GetFileName(filePath);
@@ -138,26 +116,20 @@ public sealed class UpdateForkManifestJob(
                 continue;
 
             string? platform = null;
-            if (fileName.Equals(clientBase + ".zip", StringComparison.Ordinal))
-            {
-            }
-            else if (fileName.StartsWith(clientBase + "_", StringComparison.Ordinal))
+            if (fileName.StartsWith(clientBase + "_", StringComparison.Ordinal))
             {
                 platform = fileName[(clientBase.Length + 1)..^".zip".Length];
                 if (platform.Length == 0)
                     platform = null;
             }
-            else
-            {
-                continue;
-            }
+
             if (platform == null)
                 continue;
 
             var sha256 = fileName == primaryClientFileName ? primaryClientSha256 : ComputeSha256(filePath);
             result[platform] = new ManifestArtifact
             {
-                Url = baseUrlManager.MakeBuildInfoUrl($"builds/{version}/{fileName}"),
+                Url = baseUrlManager.MakeBuildInfoUrl($"robust/version/{version}/file/{fileName}"),
                 Sha256 = Convert.ToHexString(sha256),
             };
         }
@@ -175,14 +147,6 @@ public sealed class UpdateForkManifestJob(
     {
         using var stream = File.OpenRead(filePath);
         return SHA256.HashData(stream);
-    }
-
-    private async Task QueueNotifyWatchdogUpdate(string fork)
-    {
-        var scheduler = await schedulerFactory.GetScheduler();
-        await scheduler.TriggerJob(
-            NotifyWatchdogUpdateJob.Key,
-            NotifyWatchdogUpdateJob.Data(fork));
     }
 
     private sealed class ManifestData
@@ -207,3 +171,4 @@ public sealed class UpdateForkManifestJob(
         public long? Size { get; set; }
     }
 }
+

@@ -16,9 +16,9 @@ public sealed class CdnOptions
     public string? DefaultFork { get; set; }
 
     /// <summary>
-    /// File path for the database to store files, versions and logs into.
+    /// Connection string for the database to store files, versions and logs into.
     /// </summary>
-    public string DatabaseFileName { get; set; } = "content.db";
+    public string ConnectionString { get; set; } = "Host=localhost;Database=robust_cdn;Username=postgres;Password=password";
 
     /// <summary>
     /// Whether to do stream compression over whole download requests.

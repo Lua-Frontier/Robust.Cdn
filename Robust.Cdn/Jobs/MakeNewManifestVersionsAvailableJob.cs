@@ -1,5 +1,5 @@
-﻿using System.Text.Json;
-using Dapper;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using Quartz;
 using Robust.Cdn.Helpers;
 
@@ -36,20 +36,24 @@ public sealed class MakeNewManifestVersionsAvailableJob(
             fork,
             versions.Length);
 
-        using var tx = database.Connection.BeginTransaction();
-
-        var forkId = database.Connection.QuerySingle<int>(
-            "SELECT Id FROM Fork WHERE Name = @ForkName",
-            new { ForkName = fork });
+        var forkId = database.Context.Forks
+            .Where(f => f.Name == fork)
+            .Select(f => f.Id)
+            .First();
 
         MakeVersionsAvailable(forkId, versions);
 
-        tx.Commit();
-
         var scheduler = await factory.GetScheduler();
-        await scheduler.TriggerJob(
-            UpdateForkManifestJob.Key,
-            UpdateForkManifestJob.Data(fork, notifyUpdate: true));
+        if (fork == UpdateRobustManifestJob.ForkName)
+        {
+            await scheduler.TriggerJob(UpdateRobustManifestJob.Key);
+        }
+        else
+        {
+            await scheduler.TriggerJob(
+                UpdateForkManifestJob.Key,
+                UpdateForkManifestJob.Data(fork, notifyUpdate: true));
+        }
     }
 
     private void MakeVersionsAvailable(int forkId, IEnumerable<string> versions)
@@ -58,17 +62,13 @@ public sealed class MakeNewManifestVersionsAvailableJob(
         {
             logger.LogInformation("New available version: {Version}", version);
 
-            database.Connection.Execute("""
-                UPDATE ForkVersion
-                SET Available = TRUE
-                WHERE Name = @Name
-                  AND ForkId = @ForkId
-                """,
-                new
-                {
-                    Name = version,
-                    ForkId = forkId
-                });
+            var versionEntity = database.Context.ForkVersions
+                .FirstOrDefault(v => v.Name == version && v.ForkId == forkId);
+            if (versionEntity != null)
+            {
+                versionEntity.Available = true;
+                database.Context.SaveChanges();
+            }
         }
     }
 }

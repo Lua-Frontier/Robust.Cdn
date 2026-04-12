@@ -1,5 +1,5 @@
-using System.Net.Http.Headers;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Npgsql;
 using Microsoft.Extensions.Options;
 using Quartz;
 using Robust.Cdn;
@@ -8,6 +8,7 @@ using Robust.Cdn.Controllers;
 using Robust.Cdn.Helpers;
 using Robust.Cdn.Jobs;
 using Robust.Cdn.Services;
+using System.Net.Http.Headers;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSystemd();
@@ -16,11 +17,26 @@ builder.Host.UseSystemd();
 
 builder.Services.Configure<CdnOptions>(builder.Configuration.GetSection(CdnOptions.Position));
 builder.Services.Configure<ManifestOptions>(builder.Configuration.GetSection(ManifestOptions.Position));
+builder.Services.Configure<LauncherOptions>(builder.Configuration.GetSection(LauncherOptions.Position));
+builder.Services.Configure<RobustOptions>(builder.Configuration.GetSection(RobustOptions.Position));
 
 builder.Services.AddControllersWithViews();
 builder.Services.AddScoped<BuildDirectoryManager>();
 builder.Services.AddSingleton<DownloadRequestLogger>();
 builder.Services.AddHostedService(services => services.GetRequiredService<DownloadRequestLogger>());
+
+builder.Services.AddDbContext<CdnDbContext>((serviceProvider, options) =>
+{
+    var connectionString = serviceProvider.GetRequiredService<IOptions<CdnOptions>>().Value.ConnectionString;
+    options.UseNpgsql(EnsureSearchPath(connectionString));
+});
+
+builder.Services.AddDbContext<ManifestDbContext>((serviceProvider, options) =>
+{
+    var connectionString = serviceProvider.GetRequiredService<IOptions<ManifestOptions>>().Value.ConnectionString;
+    options.UseNpgsql(EnsureSearchPath(connectionString));
+});
+
 builder.Services.AddScoped<Database>();
 builder.Services.AddScoped<ManifestDatabase>();
 builder.Services.AddScoped<PublishManager>();
@@ -34,6 +50,7 @@ builder.Services.AddQuartz(q =>
     });
     q.AddJob<NotifyWatchdogUpdateJob>(j => j.WithIdentity(NotifyWatchdogUpdateJob.Key).StoreDurably());
     q.AddJob<UpdateForkManifestJob>(j => j.WithIdentity(UpdateForkManifestJob.Key).StoreDurably());
+    q.AddJob<UpdateRobustManifestJob>(j => j.WithIdentity(UpdateRobustManifestJob.Key).StoreDurably());
     q.ScheduleJob<PruneOldManifestBuilds>(trigger => trigger.WithSimpleSchedule(schedule =>
     {
         schedule.RepeatForever().WithIntervalInHours(24);
@@ -60,6 +77,8 @@ builder.Services.AddHttpClient(NotifyWatchdogUpdateJob.HttpClientName, c =>
 
 builder.Services.AddScoped<BaseUrlManager>();
 builder.Services.AddScoped<ForkAuthHelper>();
+builder.Services.AddScoped<LauncherAuthHelper>(); // like ctrl+c ctrl+v
+builder.Services.AddScoped<RobustAuthHelper>();
 builder.Services.AddHttpContextAccessor();
 
 /*
@@ -80,7 +99,7 @@ if (!string.IsNullOrEmpty(pathBase))
 app.UseRouting();
 
 // Make sure SQLite cleanly shuts down.
-app.Lifetime.ApplicationStopped.Register(SqliteConnection.ClearAllPools);
+app.Lifetime.ApplicationStopped.Register(NpgsqlConnection.ClearAllPools);
 
 {
     using var initScope = app.Services.CreateScope();
@@ -88,39 +107,60 @@ app.Lifetime.ApplicationStopped.Register(SqliteConnection.ClearAllPools);
     var logFactory = services.GetRequiredService<ILoggerFactory>();
     var loggerStartup = logFactory.CreateLogger("Robust.Cdn.Program");
     var manifestOptions = services.GetRequiredService<IOptions<ManifestOptions>>().Value;
+    var robustOptions = services.GetRequiredService<IOptions<RobustOptions>>().Value;
     var db = services.GetRequiredService<Database>();
     var manifestDb = services.GetRequiredService<ManifestDatabase>();
 
-    if (string.IsNullOrEmpty(manifestOptions.FileDiskPath))
+    var robustConfigured = !string.IsNullOrWhiteSpace(robustOptions.FileDiskPath);
+    var forksConfigured = manifestOptions.Forks.Count > 0;
+
+    if (!forksConfigured && !robustConfigured)
+    {
+        loggerStartup.LogCritical("No Manifest.Forks and no Robust configured!");
+        return 1;
+    }
+
+    if (forksConfigured && string.IsNullOrEmpty(manifestOptions.FileDiskPath))
     {
         loggerStartup.LogCritical("Manifest.FileDiskPath not set in configuration!");
         return 1;
     }
 
-    if (manifestOptions.Forks.Count == 0)
+    if (robustConfigured && string.IsNullOrEmpty(robustOptions.PublishToken))
     {
-        loggerStartup.LogCritical("No forks defined in Manifest configuration!");
-        return 1;
+        loggerStartup.LogWarning("Robust.PublishToken is not set; /robust/publish will not work.");
     }
 
-    loggerStartup.LogDebug("Running migrations!");
-    var loggerMigrator = logFactory.CreateLogger<Migrator>();
+    loggerStartup.LogDebug("Ensuring CDN database schema");
+    db.DbContext.Database.EnsureCreated();
 
-    var success = Migrator.Migrate(services, loggerMigrator, db.Connection, "Robust.Cdn.Migrations");
-    success &= Migrator.Migrate(services, loggerMigrator, manifestDb.Connection, "Robust.Cdn.ManifestMigrations");
-    if (!success)
-        return 1;
-
-    loggerStartup.LogDebug("Done running migrations!");
+    loggerStartup.LogDebug("Ensuring manifest database schema");
+    manifestDb.DbContext.Database.EnsureCreated();
 
     loggerStartup.LogDebug("Ensuring forks created in manifest DB");
     manifestDb.EnsureForksCreated();
+    if (robustConfigured)
+    {
+        var dbContext = manifestDb.DbContext as ManifestDbContext;
+        if (dbContext != null && !dbContext.Forks.Any(f => f.Name == "robust"))
+        {
+            dbContext.Forks.Add(new ManifestFork { Name = "robust" });
+            dbContext.SaveChanges();
+        }
+    }
     loggerStartup.LogDebug("Done creating forks in manifest DB!");
 
     var scheduler = await initScope.ServiceProvider.GetRequiredService<ISchedulerFactory>().GetScheduler();
     foreach (var fork in manifestOptions.Forks.Keys)
     {
         await scheduler.TriggerJob(IngestNewCdnContentJob.Key, IngestNewCdnContentJob.Data(fork));
+        await scheduler.TriggerJob(UpdateForkManifestJob.Key, UpdateForkManifestJob.Data(fork));
+    }
+
+    if (robustConfigured)
+    {
+        await scheduler.TriggerJob(IngestNewCdnContentJob.Key, IngestNewCdnContentJob.Data("robust"));
+        await scheduler.TriggerJob(UpdateRobustManifestJob.Key);
     }
 }
 /*
@@ -137,6 +177,14 @@ if (app.Environment.IsDevelopment())
 app.UseAuthorization();
 
 app.MapControllers();
+
+static string EnsureSearchPath(string connectionString)
+{
+    var builder = new NpgsqlConnectionStringBuilder(connectionString);
+    if (string.IsNullOrWhiteSpace(builder.SearchPath))
+        builder.SearchPath = "public";
+    return builder.ToString();
+}
 
 await app.RunAsync();
 

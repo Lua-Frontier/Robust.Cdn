@@ -1,6 +1,5 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 using System.Net.Mime;
-using Dapper;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using Robust.Cdn.Config;
@@ -26,22 +25,15 @@ public sealed class ForkManifestController(
         if (!TryCheckBasicAuth(fork, out var errorResult))
             return errorResult;
 
-        var rowId = database.Connection.QuerySingleOrDefault<long>(
-            "SELECT ROWID FROM Fork WHERE Name == @Fork AND ServerManifestCache IS NOT NULL",
-            new { Fork = fork });
+        var data = database.Context.Forks
+            .Where(f => f.Name == fork)
+            .Select(f => f.ServerManifestCache)
+            .FirstOrDefault();
 
-        if (rowId == 0)
+        if (data == null)
             return NotFound();
 
-        var stream = SqliteBlobStream.Open(
-            database.Connection.Handle!,
-            "main",
-            "Fork",
-            "ServerManifestCache",
-            rowId,
-            false);
-
-        return File(stream, MediaTypeNames.Application.Json);
+        return File(new MemoryStream(data), MediaTypeNames.Application.Json);
     }
 
     [HttpGet("version/{version}/file/{file}")]
@@ -57,13 +49,8 @@ public sealed class ForkManifestController(
         if (!TryCheckBasicAuth(fork, out var errorResult))
             return errorResult;
 
-        var versionExists = database.Connection.QuerySingleOrDefault<bool>("""
-            SELECT 1
-            FROM ForkVersion, Fork
-            WHERE ForkVersion.Name = @Version
-              AND Fork.Name = @Fork
-              AND Fork.Id = ForkVersion.ForkId
-            """, new { Fork = fork, Version = version });
+        var versionExists = database.Context.ForkVersions
+            .Any(v => v.Name == version && v.Fork.Name == fork);
 
         if (!versionExists)
             return NotFound();

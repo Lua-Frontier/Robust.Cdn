@@ -1,13 +1,13 @@
-﻿namespace Robust.Cdn.Config;
+namespace Robust.Cdn.Config;
 
 public sealed class ManifestOptions
 {
     public const string Position = "Manifest";
 
     /// <summary>
-    /// File path for the database to store data in for the manifest system.
+    /// Connection string for the database to store data in for the manifest system.
     /// </summary>
-    public string DatabaseFileName { get; set; } = "manifest.db";
+    public string ConnectionString { get; set; } = "Host=localhost;Database=robust_cdn_manifest;Username=postgres;Password=password";
 
     public string FileDiskPath { get; set; } = "";
 
@@ -26,13 +26,15 @@ public sealed class ManifestOptions
 public sealed class ManifestForkOptions
 {
     public string? UpdateToken { get; set; }
-
-    /// <summary>
-    /// The name of client zip files in the directory structure, excluding the ".zip" extension.
-    /// </summary>
+    public string? FileDiskPath { get; set; }
+    public bool AllowRepublish { get; set; } = false;
     public string ClientZipName { get; set; } = "SS14.Client";
 
     public string ServerZipName { get; set; } = "SS14.Server_";
+
+    public bool IncludeClientPlatformsInManifest { get; set; } = false;
+
+    public bool ForceMakeAvailableForExistingContentVersions { get; set; } = false;
 
     public ManifestForkNotifyWatchdog[] NotifyWatchdogs { get; set; } = [];
 
@@ -48,6 +50,8 @@ public sealed class ManifestForkOptions
     /// This is seen as acceptable as those generally don't take too much space.
     /// </remarks>
     public int PruneBuildsDays { get; set; } = 90;
+
+    public int MaxBuilds { get; set; } = 0;
 
     public string? DisplayName { get; set; }
     public string? BuildsPageLink { get; set; }

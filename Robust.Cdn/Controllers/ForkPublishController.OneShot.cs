@@ -1,6 +1,6 @@
-﻿using System.IO.Compression;
 using Microsoft.AspNetCore.Mvc;
 using Robust.Cdn.Helpers;
+using System.IO.Compression;
 
 namespace Robust.Cdn.Controllers;
 
@@ -25,7 +25,8 @@ public sealed partial class ForkPublishController
         if (!ValidVersionRegex.IsMatch(request.Version))
             return BadRequest("Invalid version name");
 
-        if (VersionAlreadyExists(fork, request.Version))
+        var versionExists = VersionAlreadyExists(fork, request.Version);
+        if (versionExists && !forkConfig.AllowRepublish)
             return Conflict("Version already exists");
 
         logger.LogInformation("Starting one-shot publish for fork {Fork} version {Version}", fork, request.Version);
@@ -45,9 +46,14 @@ public sealed partial class ForkPublishController
         logger.LogDebug("Classifying archive entries...");
 
         var artifacts = ClassifyEntries(forkConfig, archive.Entries, e => e.FullName);
-        var clientArtifact = artifacts.SingleOrNull(art => art.artifact.Type == ArtifactType.Client);
-        if (clientArtifact == null)
+        var clientArtifacts = artifacts.Where(art => art.artifact.Type == ArtifactType.Client).ToList();
+        if (clientArtifacts.Count == 0)
             return BadRequest("Client zip is missing!");
+
+        var primaryClient = clientArtifacts.FirstOrDefault(c => c.artifact.Platform == "win-x64");
+        if (primaryClient.artifact == null) primaryClient = clientArtifacts.FirstOrDefault(c => c.artifact.Platform == null);
+        if (primaryClient.artifact == null)
+            primaryClient = clientArtifacts.First();
 
         var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, request.Version);
 
@@ -55,21 +61,45 @@ public sealed partial class ForkPublishController
 
         try
         {
+            if (versionExists && forkConfig.AllowRepublish)
+            {
+                logger.LogWarning("Version {Version} already exists for fork {Fork}; overwriting due to AllowRepublish.", request.Version, fork);
+                var forkId = manifestDatabase.Context.Forks
+                    .Where(f => f.Name == fork)
+                    .Select(f => f.Id)
+                    .First();
+                var toDelete = manifestDatabase.Context.ForkVersions.Where(fv => fv.ForkId == forkId && fv.Name == request.Version);
+                manifestDatabase.Context.ForkVersions.RemoveRange(toDelete);
+                manifestDatabase.Context.SaveChanges();
+                if (Directory.Exists(versionDir))
+                    Directory.Delete(versionDir, recursive: true);
+                DeleteContentVersionIfExists(fork, request.Version);
+            }
+
             Directory.CreateDirectory(versionDir);
 
             var diskFiles = ExtractZipToVersionDir(artifacts, versionDir);
-            var buildJson = GenerateBuildJson(diskFiles, clientArtifact.Value.artifact, metadata, fork);
-            InjectBuildJsonIntoServers(diskFiles, buildJson);
 
-            using var tx = manifestDatabase.Connection.BeginTransaction();
+            var clientByRid = clientArtifacts
+                .Where(c => c.artifact.Platform != null)
+                .ToDictionary(c => c.artifact.Platform!, c => c.artifact, StringComparer.Ordinal);
+
+            InjectBuildJsonIntoServers(
+                diskFiles,
+                metadata,
+                fork,
+                serverArtifact =>
+                {
+                    if (serverArtifact.Platform != null && clientByRid.TryGetValue(serverArtifact.Platform, out var ridClient))
+                    { return ridClient; }
+                    return primaryClient.artifact;
+                });
 
             AddVersionToDatabase(
-                clientArtifact.Value.artifact,
+                primaryClient.artifact,
                 diskFiles,
                 fork,
                 metadata);
-
-            tx.Commit();
 
             await QueueIngestJobAsync(fork);
 

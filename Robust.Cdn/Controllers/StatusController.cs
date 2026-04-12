@@ -1,5 +1,4 @@
 ﻿using System.Reflection;
-using Dapper;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Robust.Cdn.Controllers;
@@ -19,9 +18,7 @@ public class StatusController : ControllerBase
     {
         try
         {
-            var con = _db.Connection;
-            var versionCount = con.QuerySingleOrDefault<int>("SELECT COUNT(Id) FROM ContentVersion");
-
+            var versionCount = _db.Context.ContentVersions.Count();
             var assemblyVersion = Assembly.GetExecutingAssembly().GetName().Version;
 
             return Ok(new

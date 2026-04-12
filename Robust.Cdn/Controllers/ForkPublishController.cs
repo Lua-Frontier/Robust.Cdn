@@ -1,9 +1,9 @@
-﻿using System.IO.Compression;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using Dapper;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Mvc;
 using Quartz;
 using Robust.Cdn.Config;
@@ -37,6 +37,7 @@ namespace Robust.Cdn.Controllers;
 public sealed partial class ForkPublishController(
     ForkAuthHelper authHelper,
     IHttpClientFactory httpFactory,
+    Database cdnDatabase,
     ManifestDatabase manifestDatabase,
     ISchedulerFactory schedulerFactory,
     BaseUrlManager baseUrlManager,
@@ -50,20 +51,30 @@ public sealed partial class ForkPublishController(
 
     public const string PublishFetchHttpClient = "PublishFetch";
 
+    private void DeleteContentVersionIfExists(string fork, string version)
+    {
+        try
+        {
+            var versionsToDelete = cdnDatabase.Context.ContentVersions
+                .Where(cv => cv.Fork.Name == fork && cv.Version == version)
+                .ToList();
+
+            if (versionsToDelete.Any())
+            {
+                cdnDatabase.Context.ContentVersions.RemoveRange(versionsToDelete);
+                cdnDatabase.Context.SaveChanges();
+            }
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning(e, "Failed to delete existing content version for fork {Fork} version {Version}", fork, version);
+        }
+    }
+
     private bool VersionAlreadyExists(string fork, string version)
     {
-        return manifestDatabase.Connection.QuerySingleOrDefault<bool>(
-            """
-            SELECT 1
-            FROM Fork, ForkVersion
-            WHERE Fork.Id = ForkVersion.ForkId
-              AND Fork.Name = @ForkName
-              AND ForkVersion.Name = @ForkVersion
-            """, new
-            {
-                ForkName = fork,
-                ForkVersion = version
-            });
+        return manifestDatabase.Context.ForkVersions
+            .Any(fv => fv.Fork.Name == fork && fv.Name == version);
     }
 
     private List<(T key, Artifact artifact)> ClassifyEntries<T>(
@@ -97,6 +108,18 @@ public sealed partial class ForkPublishController(
     {
         if (name == $"{forkConfig.ClientZipName}.zip")
             return new Artifact { Type = ArtifactType.Client };
+
+        var clientPrefix = $"{forkConfig.ClientZipName}_";
+        if (name.StartsWith(clientPrefix, StringComparison.Ordinal) && name.EndsWith(".zip", StringComparison.Ordinal))
+        {
+            var rid = name[clientPrefix.Length..^".zip".Length];
+            if (rid.Length == 0) return null;
+            return new Artifact
+            {
+                Type = ArtifactType.Client,
+                Platform = rid
+            };
+        }
 
         if (name.StartsWith(forkConfig.ServerZipName) && name.EndsWith(".zip"))
         {
@@ -185,7 +208,7 @@ public sealed partial class ForkPublishController(
         return HashHelper.HashBlake2B(stream);
     }
 
-    private void InjectBuildJsonIntoServers(Dictionary<Artifact, string> diskFiles, MemoryStream buildJson)
+    private void InjectBuildJsonIntoServers(Dictionary<Artifact, string> diskFiles, VersionMetadata metadata, string fork, Func<Artifact, Artifact> resolveClient)
     {
         logger.LogDebug("Adding build.json to server builds");
 
@@ -195,7 +218,7 @@ public sealed partial class ForkPublishController(
                 continue;
 
             logger.LogTrace("Adding build.json to build {ServerBuildFileName}", diskPath);
-
+            using var buildJson = GenerateBuildJson(diskFiles, resolveClient(artifact), metadata, fork);
             using var zipFile = System.IO.File.Open(diskPath, FileMode.Open);
             using var zip = new ZipArchive(zipFile, ZipArchiveMode.Update);
 
@@ -209,7 +232,6 @@ public sealed partial class ForkPublishController(
             using var entryStream = buildJsonEntry.Open();
 
             buildJson.CopyTo(entryStream);
-            buildJson.Position = 0;
         }
     }
 
@@ -221,26 +243,47 @@ public sealed partial class ForkPublishController(
     {
         logger.LogDebug("Adding new version to database");
 
-        var dbCon = manifestDatabase.Connection;
-
-        var forkId = dbCon.QuerySingle<int>("SELECT Id FROM Fork WHERE Name = @Name", new { Name = fork });
+        var forkId = manifestDatabase.Context.Forks
+            .Where(f => f.Name == fork)
+            .Select(f => f.Id)
+            .First();
 
         var (clientName, clientSha256, _) = GetFileNameSha256Pair(diskFiles[clientArtifact]);
 
-        var versionId = dbCon.QuerySingle<int>("""
-            INSERT INTO ForkVersion (Name, ForkId, PublishedTime, ClientFileName, ClientSha256, EngineVersion)
-            VALUES (@Name, @ForkId, @PublishTime, @ClientName, @ClientSha256, @EngineVersion)
-            RETURNING Id
-            """,
-            new
+        var existingVersion = manifestDatabase.Context.ForkVersions
+            .FirstOrDefault(fv => fv.ForkId == forkId && fv.Name == metadata.Version);
+
+        if (existingVersion == null)
+        {
+            existingVersion = new ForkVersion
             {
-                Name = metadata.Version,
                 ForkId = forkId,
-                ClientName = clientName,
-                ClientSha256 = clientSha256,
-                metadata.EngineVersion,
-                PublishTime = DateTime.UtcNow
-            });
+                Name = metadata.Version,
+                PublishedTime = DateTime.UtcNow,
+                ClientFileName = clientName,
+                Sha256 = clientSha256,
+                EngineVersion = metadata.EngineVersion,
+                Available = false
+            };
+            manifestDatabase.Context.ForkVersions.Add(existingVersion);
+        }
+        else
+        {
+            existingVersion.PublishedTime = DateTime.UtcNow;
+            existingVersion.ClientFileName = clientName;
+            existingVersion.Sha256 = clientSha256;
+            existingVersion.EngineVersion = metadata.EngineVersion;
+            existingVersion.Available = false;
+        }
+
+        manifestDatabase.Context.SaveChanges();
+        var versionId = existingVersion.Id;
+
+        // Remove existing server builds
+        var existingServerBuilds = manifestDatabase.Context.ForkVersionServerBuilds
+            .Where(s => s.ForkVersionId == versionId)
+            .ToList();
+        manifestDatabase.Context.ForkVersionServerBuilds.RemoveRange(existingServerBuilds);
 
         foreach (var (artifact, diskPath) in diskFiles)
         {
@@ -249,19 +292,18 @@ public sealed partial class ForkPublishController(
 
             var (serverName, serverSha256, fileSize) = GetFileNameSha256Pair(diskPath);
 
-            dbCon.Execute("""
-                INSERT INTO ForkVersionServerBuild (ForkVersionId, Platform, FileName, Sha256, FileSize)
-                VALUES (@ForkVersion, @Platform, @ServerName, @ServerSha256, @FileSize)
-                """,
-                new
-                {
-                    ForkVersion = versionId,
-                    artifact.Platform,
-                    ServerName = serverName,
-                    ServerSha256 = serverSha256,
-                    FileSize = fileSize
-                });
+            var serverBuild = new ForkVersionServerBuild
+            {
+                ForkVersionId = versionId,
+                Platform = artifact.Platform,
+                FileName = serverName,
+                Sha256 = serverSha256,
+                FileSize = (int?)fileSize
+            };
+            manifestDatabase.Context.ForkVersionServerBuilds.Add(serverBuild);
         }
+
+        manifestDatabase.Context.SaveChanges();
     }
 
     private static (string name, byte[] hash, long size) GetFileNameSha256Pair(string diskPath)

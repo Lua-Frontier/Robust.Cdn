@@ -1,69 +1,70 @@
-﻿using Dapper;
-using Microsoft.Data.Sqlite;
+﻿using System.Data;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Npgsql;
 using Robust.Cdn.Config;
 
 namespace Robust.Cdn;
 
 public abstract class BaseScopedDatabase : IDisposable
 {
-    private SqliteConnection? _connection;
-    public SqliteConnection Connection => _connection ??= OpenConnection();
+    private readonly DbContext _context;
 
-    private SqliteConnection OpenConnection()
+    protected BaseScopedDatabase(DbContext context)
     {
-        var con = new SqliteConnection(GetConnectionString());
-        con.Open();
-        con.Execute("PRAGMA journal_mode=WAL");
-        return con;
+        _context = context;
+    }
+
+    public DbContext DbContext => _context;
+
+    public NpgsqlConnection Connection
+    {
+        get
+        {
+            var connection = (NpgsqlConnection)_context.Database.GetDbConnection();
+            if (connection.State != ConnectionState.Open)
+            {
+                _context.Database.OpenConnection();
+            }
+
+            return connection;
+        }
     }
 
 #pragma warning disable CA1816
     public void Dispose()
     {
-        _connection?.Dispose();
+        _context.Dispose();
     }
 #pragma warning restore CA1816
-
-    protected abstract string GetConnectionString();
-
-    protected string GetConnectionStringForFile(string fileName)
-    {
-        return $"Data Source={fileName};Mode=ReadWriteCreate;Pooling=True;Foreign Keys=True";
-    }
 }
 
 /// <summary>
 /// Database service for CDN functionality.
 /// </summary>
-public sealed class Database(IOptions<CdnOptions> options) : BaseScopedDatabase
+public sealed class Database(CdnDbContext context) : BaseScopedDatabase(context)
 {
-    protected override string GetConnectionString()
-    {
-        return GetConnectionStringForFile(options.Value.DatabaseFileName);
-    }
+    public CdnDbContext Context => (CdnDbContext)DbContext;
 }
 
 /// <summary>
 /// Database service for server manifest functionality.
 /// </summary>
-public sealed class ManifestDatabase(IOptions<ManifestOptions> options) : BaseScopedDatabase
+public sealed class ManifestDatabase(ManifestDbContext context, IOptions<ManifestOptions> options) : BaseScopedDatabase(context)
 {
-    protected override string GetConnectionString()
-    {
-        return GetConnectionStringForFile(options.Value.DatabaseFileName);
-    }
+    public ManifestDbContext Context => (ManifestDbContext)DbContext;
 
     public void EnsureForksCreated()
     {
-        var con = Connection;
-        using var tx = con.BeginTransaction();
-
+        var db = (ManifestDbContext)DbContext;
         foreach (var forkName in options.Value.Forks.Keys)
         {
-            con.Execute("INSERT INTO Fork (Name) VALUES (@Name) ON CONFLICT DO NOTHING", new { Name = forkName });
+            if (!db.Forks.Any(f => f.Name == forkName))
+            {
+                db.Forks.Add(new ManifestFork { Name = forkName });
+            }
         }
 
-        tx.Commit();
+        db.SaveChanges();
     }
 }

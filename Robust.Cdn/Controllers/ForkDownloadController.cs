@@ -1,9 +1,10 @@
-﻿using System.Buffers.Binary;
+using System.Buffers.Binary;
 using System.Collections;
 using System.Diagnostics;
-using Dapper;
+using System.Linq;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Robust.Cdn.Config;
 using Robust.Cdn.Helpers;
@@ -11,13 +12,12 @@ using Robust.Cdn.Lib;
 using Robust.Cdn.Services;
 using SharpZstd;
 using SharpZstd.Interop;
-using SQLitePCL;
 
 namespace Robust.Cdn.Controllers;
 
 [ApiController]
 [Route("/fork/{fork}/version/{version}")]
-public sealed class DownloadController(
+public class DownloadController(
     Database db,
     ILogger<DownloadController> logger,
     IOptionsSnapshot<CdnOptions> options,
@@ -33,41 +33,28 @@ public sealed class DownloadController(
     [HttpGet("manifest")]
     public IActionResult GetManifest(string fork, string version)
     {
-        var con = db.Connection;
-        con.BeginTransaction(deferred: true);
+        var versionEntry = db.Context.ContentVersions
+            .AsNoTracking()
+            .Where(cv => cv.Fork.Name == fork && cv.Version == version)
+            .Select(cv => new { cv.Id, cv.ManifestHash, cv.ManifestData })
+            .FirstOrDefault();
 
-        var (row, hash) = con.QuerySingleOrDefault<(long, byte[])>(
-            """
-            SELECT CV.Id, CV.ManifestHash
-            FROM ContentVersion CV
-            INNER JOIN main.Fork F on F.Id = CV.ForkId
-            WHERE F.Name = @Fork AND Version = @Version
-            """,
-            new
-            {
-                Fork = fork,
-                Version = version
-            });
-
-        if (row == 0)
+        if (versionEntry is null)
             return NotFound();
 
-        // I'll be honest I'm not sure how useful this is.
-        // I just wanted to make that SELECT less lonely.
-        Response.Headers["X-Manifest-Hash"] = Convert.ToHexString(hash);
-
-        var blob = SqliteBlobStream.Open(con.Handle!, "main", "ContentVersion", "ManifestData", row, false);
+        Response.Headers["X-Manifest-Hash"] = Convert.ToHexString(versionEntry.ManifestHash);
+        var data = versionEntry.ManifestData;
 
         if (AcceptsZStd)
         {
             Response.Headers.ContentEncoding = "zstd";
 
-            return File(blob, "text/plain");
+            return File(new MemoryStream(data), "text/plain; charset=utf-8");
         }
 
-        var decompress = new ZstdDecodeStream(blob, leaveOpen: false);
+        var decompress = new ZstdDecodeStream(new MemoryStream(data), leaveOpen: false);
 
-        return File(decompress, "text/plain");
+        return File(decompress, "text/plain; charset=utf-8");
     }
 
     [HttpOptions("download")]
@@ -96,31 +83,21 @@ public sealed class DownloadController(
         // TODO: this request limiting logic is pretty bad.
         HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>()!.MaxRequestBodySize = MaxDownloadRequestSize;
 
-        var con = db.Connection;
-        con.BeginTransaction(deferred: true);
+        var versionData = await db.Context.ContentVersions
+            .AsNoTracking()
+            .Where(cv => cv.Fork.Name == fork && cv.Version == version)
+            .Select(cv => new { cv.Id, cv.CountDistinctBlobs })
+            .FirstOrDefaultAsync();
 
-        var (versionId, countDistinctBlobs) = con.QuerySingleOrDefault<(long, int)>(
-            """
-            SELECT CV.Id, CV.CountDistinctBlobs
-            FROM ContentVersion CV
-            INNER JOIN main.Fork F on F.Id = CV.ForkId
-            WHERE F.Name = @Fork AND Version = @Version
-            """,
-            new
-            {
-                Fork = fork,
-                Version = version
-            });
-
-        if (versionId == 0)
+        if (versionData is null)
             return NotFound();
 
-        var entriesCount = con.ExecuteScalar<int>(
-            "SELECT COUNT(*) FROM ContentManifestEntry WHERE VersionId = @VersionId",
-            new
-            {
-                VersionId = versionId
-            });
+        var versionId = versionData.Id;
+        var countDistinctBlobs = versionData.CountDistinctBlobs;
+
+        var entriesCount = await db.Context.ContentManifestEntries
+            .AsNoTracking()
+            .CountAsync(e => e.VersionId == versionId);
 
         var buffer = new MemoryStream();
         await Request.Body.CopyToAsync(buffer);
@@ -216,20 +193,8 @@ public sealed class DownloadController(
 
             await outStream.WriteAsync(streamHeader);
 
-            SqliteBlobStream? blob = null;
-            ZStdDecompressStream? decompress = null;
-
             try
             {
-                using var stmt =
-                    con.Handle!.Prepare(
-                        "SELECT c.Compression, c.Size, c.Id " +
-                        "FROM ContentManifestEntry cme " +
-                        "INNER JOIN Content c on c.Id = cme.ContentId " +
-                        "WHERE cme.VersionId = @VersionId AND cme.ManifestIdx = @ManifestIdx");
-
-                stmt.BindInt64(1, versionId); // @VersionId
-
                 offset = 0;
                 var swSqlite = new Stopwatch();
                 var count = 0;
@@ -238,64 +203,57 @@ public sealed class DownloadController(
                     var index = BinaryPrimitives.ReadInt32LittleEndian(buf.Slice(offset, 4).Span);
 
                     swSqlite.Start();
-                    stmt.BindInt(2, index);
 
-                    if (stmt.Step() != raw.SQLITE_ROW)
-                        throw new InvalidOperationException("Unable to find manifest row??");
+                    var content = await db.Context.ContentManifestEntries
+                    .AsNoTracking()
+                    .Where(cme => cme.VersionId == versionId && cme.ManifestIdx == index)
+                    .Select(cme => new { Compression = (ContentCompression)cme.Content.Compression, cme.Content.Size, cme.Content.Data })
+                    .FirstAsync();
 
-                    var compression = (ContentCompression)stmt.ColumnInt(0);
-                    var size = stmt.ColumnInt(1);
-                    var rowId = stmt.ColumnInt64(2);
-
-                    stmt.Reset();
                     swSqlite.Stop();
+
+                    var compression = content.Compression;
+                    var size = content.Size;
+                    var data = content.Data;
 
                     // _aczSawmill.Debug($"{index:D5}: {blobLength:D8} {dataOffset:D8} {dataLength:D8}");
 
                     BinaryPrimitives.WriteInt32LittleEndian(fileHeader, size);
 
-                    if (blob == null)
-                    {
-                        blob = SqliteBlobStream.Open(con.Handle!, "main", "Content", "Data", rowId, false);
-                        if (!preCompressed)
-                            decompress = new ZStdDecompressStream(blob, ownStream: false);
-                    }
-                    else
-                    {
-                        blob.Reopen(rowId);
-                    }
-
-                    Stream copyFromStream = blob;
+                    Stream copyFromStream = new MemoryStream(data);
+                    ZStdDecompressStream? localDecompress = null;
                     if (preCompressed)
                     {
                         // If we are doing pre-compression, just write the DB contents directly.
                         BinaryPrimitives.WriteInt32LittleEndian(
                             fileHeader.AsSpan(4, 4),
-                            compression == ContentCompression.ZStd ? (int)blob.Length : 0);
+                            compression == ContentCompression.ZStd ? data.Length : 0);
                     }
                     else if (compression == ContentCompression.ZStd)
                     {
                         // If we are not doing pre-compression but the DB entry is compressed, we have to decompress!
-                        copyFromStream = decompress!;
+                        localDecompress = new ZStdDecompressStream(copyFromStream, ownStream: false);
+                        copyFromStream = localDecompress;
                     }
 
                     await outStream.WriteAsync(fileHeader);
 
                     await copyFromStream.CopyToAsync(outStream);
 
+                    localDecompress?.Dispose();
+
                     offset += 4;
                     count += 1;
                 }
 
                 logger.LogTrace(
-                    "Total SQLite: {SqliteElapsed} ms, ns / iter: {NanosPerIter}",
+                    "Total PostgreSQL: {SqliteElapsed} ms, ns / iter: {NanosPerIter}",
                     swSqlite.ElapsedMilliseconds,
                     swSqlite.Elapsed.TotalMilliseconds * 1_000_000 / count);
             }
             finally
             {
-                blob?.Dispose();
-                decompress?.Dispose();
+                // No blob to dispose
             }
         }
 

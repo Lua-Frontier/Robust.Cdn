@@ -1,4 +1,4 @@
-﻿using Dapper;
+﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Quartz;
 using Robust.Cdn.Config;
@@ -27,32 +27,26 @@ public sealed class DeleteInProgressPublishesJob(
 
         logger.LogTrace("Checking for timed out in-progress publishes");
 
-        var db = manifestDatabase.Connection;
-        using var tx = db.BeginTransaction();
-
         var deleteBefore = timeProvider.GetUtcNow() - TimeSpan.FromMinutes(opts.InProgressPublishTimeoutMinutes);
 
         var totalDeleted = 0;
 
-        var inProgress = db.Query<(int, string, string, DateTime)>("""
-            SELECT PublishInProgress.Id, Version, Fork.Name, StartTime
-            FROM PublishInProgress
-            INNER JOIN Fork ON Fork.Id = PublishInProgress.ForkId
-            """);
+        var inProgress = manifestDatabase.Context.PublishInProgresses
+            .AsNoTracking()
+            .Select(p => new { p.Id, p.Version, ForkName = p.Fork.Name, p.StartTime })
+            .ToList();
 
-        foreach (var (_, name, forkName, startTime) in inProgress)
+        foreach (var item in inProgress)
         {
-            if (startTime >= deleteBefore)
+            if (item.StartTime >= deleteBefore)
                 continue;
 
-            logger.LogInformation("Deleting timed out publish for fork {Fork} version {Version}", forkName, name);
+            logger.LogInformation("Deleting timed out publish for fork {Fork} version {Version}", item.ForkName, item.Version);
 
-            publishManager.AbortMultiPublish(forkName, name, tx, commit: false);
+            publishManager.AbortMultiPublish(item.ForkName, item.Version);
 
             totalDeleted += 1;
         }
-
-        tx.Commit();
 
         logger.LogInformation("Deleted {TotalDeleted} timed out publishes", totalDeleted);
 

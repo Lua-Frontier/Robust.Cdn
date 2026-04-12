@@ -1,29 +1,29 @@
-using System.Diagnostics.CodeAnalysis;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Robust.Cdn.Config;
+using Robust.Cdn.Jobs;
+using Robust.Cdn.Helpers;
 
 namespace Robust.Cdn.Controllers;
 
 [Controller]
-[Route("/fork/{fork}")]
-public sealed class ForkBuildPageController(
+[Route("/robust")]
+public sealed class RobustBuildPageController(
     ManifestDatabase database,
-    IOptions<ManifestOptions> manifestOptions)
+    IOptions<RobustOptions> robustOptions)
     : Controller
 {
     [HttpGet]
-    public IActionResult Index(string fork)
+    public IActionResult Index()
     {
-        if (!TryCheckBasicAuth(fork, out var errorResult))
-            return errorResult;
+        if (!TryCheckBasicAuth(out var errorResult)) return errorResult;
 
         var versions = new List<Version>();
 
         var dbVersions = database.Context.ForkVersions
             .AsNoTracking()
-            .Where(v => v.Fork.Name == fork && v.Available)
+            .Where(v => v.Fork.Name == UpdateRobustManifestJob.ForkName && v.Available)
             .OrderByDescending(v => v.PublishedTime)
             .Take(50)
             .Select(v => new { v.Id, v.Name, v.PublishedTime, v.EngineVersion })
@@ -52,25 +52,31 @@ public sealed class ForkBuildPageController(
             });
         }
 
-        return View(new Model
+        return View("Index", new Model
         {
-            Fork = fork,
-            Options = manifestOptions.Value.Forks[fork],
             Versions = versions
         });
     }
 
-    private bool TryCheckBasicAuth(
-        string fork,
-        [NotNullWhen(false)] out IActionResult? errorResult)
+    private bool TryCheckBasicAuth(out IActionResult? errorResult)
     {
-        return ForkManifestController.TryCheckBasicAuth(HttpContext, manifestOptions.Value, fork, out errorResult);
+        var opts = robustOptions.Value;
+        if (!opts.Private)
+        {
+            errorResult = null;
+            return true;
+        }
+
+        return AuthorizationUtility.CheckBasicAuth(
+            HttpContext,
+            "robust",
+            a => opts.PrivateUsers.GetValueOrDefault(a),
+            out _,
+            out errorResult);
     }
 
     public sealed class Model
     {
-        public required string Fork;
-        public required ManifestForkOptions Options;
         public required List<Version> Versions;
     }
 
@@ -97,3 +103,4 @@ public sealed class ForkBuildPageController(
         public required string? EngineVersion { get; set; }
     }
 }
+
