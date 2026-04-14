@@ -55,6 +55,12 @@ public sealed class CountWriteStream : Stream
         _baseStream.Write(buffer, offset, count);
     }
 
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        Written += count;
+        return _baseStream.WriteAsync(buffer, offset, count, cancellationToken);
+    }
+
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer,
         CancellationToken cancellationToken = new CancellationToken())
     {
