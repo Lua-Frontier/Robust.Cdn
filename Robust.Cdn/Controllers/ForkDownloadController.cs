@@ -1,4 +1,4 @@
-﻿using System.Buffers.Binary;
+using System.Buffers.Binary;
 using System.Collections;
 using System.Diagnostics;
 using Dapper;
@@ -17,7 +17,7 @@ namespace Robust.Cdn.Controllers;
 
 [ApiController]
 [Route("/fork/{fork}/version/{version}")]
-public sealed class DownloadController(
+public class DownloadController(
     Database db,
     ILogger<DownloadController> logger,
     IOptionsSnapshot<CdnOptions> options,
@@ -62,12 +62,12 @@ public sealed class DownloadController(
         {
             Response.Headers.ContentEncoding = "zstd";
 
-            return File(blob, "text/plain");
+            return File(blob, "text/plain; charset=utf-8");
         }
 
         var decompress = new ZstdDecodeStream(blob, leaveOpen: false);
 
-        return File(decompress, "text/plain");
+        return File(decompress, "text/plain; charset=utf-8");
     }
 
     [HttpOptions("download")]

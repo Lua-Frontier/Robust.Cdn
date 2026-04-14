@@ -15,7 +15,7 @@ public sealed partial class ForkPublishController
         [FromBody] PublishMultiRequest request,
         CancellationToken cancel)
     {
-        if (!authHelper.IsAuthValid(fork, out _, out var failureResult))
+        if (!authHelper.IsAuthValid(fork, out var forkConfig, out var failureResult))
             return failureResult;
 
         baseUrlManager.ValidateBaseUrl();
@@ -23,7 +23,8 @@ public sealed partial class ForkPublishController
         if (!ValidVersionRegex.IsMatch(request.Version))
             return BadRequest("Invalid version name");
 
-        if (VersionAlreadyExists(fork, request.Version))
+        var versionExists = VersionAlreadyExists(fork, request.Version);
+        if (versionExists && !forkConfig.AllowRepublish)
             return Conflict("Version already exists");
 
         var dbCon = manifestDatabase.Connection;
@@ -56,9 +57,10 @@ public sealed partial class ForkPublishController
                 ForkId = forkId,
                 StartTime = DateTime.UtcNow
             });
-
-        var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, request.Version);
-        Directory.CreateDirectory(versionDir);
+        var inProgressDir = buildDirectoryManager.GetInProgressPublishPath(fork, request.Version);
+        if (Directory.Exists(inProgressDir))
+            Directory.Delete(inProgressDir, recursive: true);
+        Directory.CreateDirectory(inProgressDir);
 
         await tx.CommitAsync(cancel);
 
@@ -97,11 +99,12 @@ public sealed partial class ForkPublishController
         if (versionId == null)
             return NotFound("Unknown in-progress version");
 
-        var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, version);
-        var filePath = Path.Combine(versionDir, fileName);
+        var inProgressDir = buildDirectoryManager.GetInProgressPublishPath(fork, version);
+        Directory.CreateDirectory(inProgressDir);
+        var filePath = buildDirectoryManager.GetInProgressPublishFilePath(fork, version, fileName);
 
         if (System.IO.File.Exists(filePath))
-            return Conflict("File already published");
+            System.IO.File.Delete(filePath);
 
         logger.LogDebug("Receiving file {FileName} for multi-publish version {Version}", fileName, version);
 
@@ -139,28 +142,67 @@ public sealed partial class ForkPublishController
 
         logger.LogInformation("Finishing multi publish {Version} for fork {Fork}", request.Version, fork);
 
+        var inProgressDir = buildDirectoryManager.GetInProgressPublishPath(fork, request.Version);
         var versionDir = buildDirectoryManager.GetBuildVersionPath(fork, request.Version);
+        var expectedClientZip = $"{forkConfig.ClientZipName}.zip";
 
         logger.LogDebug("Classifying entries...");
 
         var artifacts = ClassifyEntries(
             forkConfig,
-            Directory.GetFiles(versionDir),
-            item => Path.GetRelativePath(versionDir, item));
+            Directory.Exists(inProgressDir) ? Directory.GetFiles(inProgressDir) : [],
+            item => Path.GetRelativePath(inProgressDir, item));
 
-        var clientArtifact = artifacts.SingleOrNull(art => art.artifact.Type == ArtifactType.Client);
-        if (clientArtifact == null)
+        var clientArtifacts = artifacts.Where(art => art.artifact.Type == ArtifactType.Client).ToList();
+        if (clientArtifacts.Count == 0)
         {
             publishManager.AbortMultiPublish(fork, request.Version, tx, commit: true);
-            return UnprocessableEntity("Publish failed: no client zip was provided");
+            var diskFileNames = Directory.Exists(inProgressDir)
+                ? Directory.GetFiles(inProgressDir).Select(Path.GetFileName)
+                : [];
+
+            return UnprocessableEntity(
+                $"Publish failed: no client zip was provided. Expected '{expectedClientZip}'. " +
+                $"Files on disk: {string.Join(", ", diskFileNames)}");
         }
 
+        var primaryClient = clientArtifacts.FirstOrDefault(c => c.artifact.Platform == "win-x64");
+        if (primaryClient.artifact == null) primaryClient = clientArtifacts.FirstOrDefault(c => c.artifact.Platform == null);
+        if (primaryClient.artifact == null) primaryClient = clientArtifacts.First();
         var diskFiles = artifacts.ToDictionary(i => i.artifact, i => i.key);
+        var clientByRid = clientArtifacts
+            .Where(c => c.artifact.Platform != null)
+            .ToDictionary(c => c.artifact.Platform!, c => c.artifact, StringComparer.Ordinal);
+        InjectBuildJsonIntoServers(
+            diskFiles,
+            versionMetadata,
+            fork,
+            serverArtifact =>
+            {
+                if (serverArtifact.Platform != null &&
+                    clientByRid.TryGetValue(serverArtifact.Platform, out var ridClient))
+                {
+                    return ridClient;
+                }
+                return primaryClient.artifact;
+            });
+        if (forkConfig.AllowRepublish)
+            DeleteContentVersionIfExists(fork, request.Version);
+        if (Directory.Exists(versionDir))
+        {
+            if (!forkConfig.AllowRepublish)
+                return Conflict("Version already exists");
 
-        var buildJson = GenerateBuildJson(diskFiles, clientArtifact.Value.artifact, versionMetadata, fork);
-        InjectBuildJsonIntoServers(diskFiles, buildJson);
+            Directory.Delete(versionDir, recursive: true);
+        }
 
-        AddVersionToDatabase(clientArtifact.Value.artifact, diskFiles, fork, versionMetadata);
+        Directory.CreateDirectory(Path.GetDirectoryName(versionDir)!);
+        Directory.Move(inProgressDir, versionDir);
+        var diskFilesFinal = diskFiles.ToDictionary(
+            kvp => kvp.Key,
+            kvp => Path.Combine(versionDir, Path.GetFileName(kvp.Value)));
+
+        AddVersionToDatabase(primaryClient.artifact, diskFilesFinal, fork, versionMetadata);
 
         dbCon.Execute(
             "DELETE FROM PublishInProgress WHERE Version = @Name AND ForkId = @Fork",

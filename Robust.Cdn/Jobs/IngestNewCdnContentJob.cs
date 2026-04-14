@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.IO.Compression;
 using System.Text;
 using Dapper;
@@ -18,6 +18,7 @@ public sealed class IngestNewCdnContentJob(
     Database cdnDatabase,
     IOptions<CdnOptions> cdnOptions,
     IOptions<ManifestOptions> manifestOptions,
+    IOptions<RobustOptions> robustOptions,
     ISchedulerFactory schedulerFactory,
     BuildDirectoryManager buildDirectoryManager,
     ILogger<IngestNewCdnContentJob> logger) : IJob
@@ -36,37 +37,41 @@ public sealed class IngestNewCdnContentJob(
 
         logger.LogInformation("Ingesting new versions for fork: {Fork}", fork);
 
-        var forkConfig = manifestOptions.Value.Forks[fork];
+        var isRobust = fork == UpdateRobustManifestJob.ForkName;
+        var clientZipName = isRobust ? robustOptions.Value.ClientZipName : manifestOptions.Value.Forks[fork].ClientZipName;
+        var forceMakeAvailable = !isRobust && manifestOptions.Value.Forks[fork].ForceMakeAvailableForExistingContentVersions;
 
         var connection = cdnDatabase.Connection;
-        var transaction = connection.BeginTransaction();
 
-        List<string> newVersions;
-        try
+        var (versionsToIngest, versionsToMakeAvailable) = FindNewVersions(fork, connection, clientZipName, forceMakeAvailable, isRobust);
+        if (versionsToIngest.Count == 0 && versionsToMakeAvailable.Count == 0)
+            return;
+
+        if (versionsToIngest.Count > 0)
         {
-            newVersions = FindNewVersions(fork, connection);
+            var transaction = connection.BeginTransaction();
+            try
+            {
+                IngestNewVersions(
+                    fork,
+                    connection,
+                    versionsToIngest,
+                    ref transaction,
+                    clientZipName,
+                    isRobust,
+                    context.CancellationToken);
 
-            if (newVersions.Count == 0)
-                return;
-
-            IngestNewVersions(
-                fork,
-                connection,
-                newVersions,
-                ref transaction,
-                forkConfig,
-                context.CancellationToken);
-
-            logger.LogDebug("Committing database");
-
-            transaction.Commit();
+                logger.LogDebug("Committing database");
+                transaction.Commit();
+            }
+            finally
+            {
+                transaction.Dispose();
+            }
         }
-        finally
-        {
-            transaction.Dispose();
-        }
 
-        await QueueManifestAvailable(fork, newVersions);
+        if (versionsToMakeAvailable.Count > 0)
+            await QueueManifestAvailable(fork, versionsToMakeAvailable);
     }
 
     private async Task QueueManifestAvailable(string fork, IEnumerable<string> newVersions)
@@ -82,11 +87,11 @@ public sealed class IngestNewCdnContentJob(
         SqliteConnection connection,
         List<string> newVersions,
         ref SqliteTransaction transaction,
-        ManifestForkOptions forkConfig,
+        string clientZipName,
+        bool isRobust,
         CancellationToken cancel)
     {
         var cdnOpts = cdnOptions.Value;
-        var manifestOpts = manifestOptions.Value;
 
         var forkId = EnsureForkCreated(fork, connection);
 
@@ -135,11 +140,22 @@ public sealed class IngestNewCdnContentJob(
                     new { Version = version, ForkId = forkId });
 
                 stmtInsertContentManifestEntry.BindInt64(1, versionId);
-
-                var zipFilePath = buildDirectoryManager.GetBuildVersionFilePath(
-                    fork,
-                    version,
-                    forkConfig.ClientZipName + ".zip");
+                var versionDir = isRobust ? buildDirectoryManager.GetRobustBuildVersionPath(version) : buildDirectoryManager.GetBuildVersionPath(fork, version);
+                var exactZip = Path.Combine(versionDir, clientZipName + ".zip"); //!!!!!!!!!
+                string zipFilePath;
+                if (File.Exists(exactZip))
+                { zipFilePath = exactZip; }
+                else
+                {
+                    var candidates = Directory.Exists(versionDir) ? Directory.EnumerateFiles(versionDir, clientZipName + "_*.zip").ToList() : [];
+                    zipFilePath = candidates
+                        .OrderBy(p => p.EndsWith("_win-x64.zip", StringComparison.Ordinal) ? 0 : 1)
+                        .ThenBy(p => p, StringComparer.Ordinal)
+                        .FirstOrDefault()
+                        ?? throw new FileNotFoundException(
+                            $"Could not find client zip for '{clientZipName}' in '{versionDir}'. " +
+                            $"Expected '{clientZipName}.zip' or '{clientZipName}_*.zip'.");
+                }
 
                 using var zipFile = ZipFile.OpenRead(zipFilePath);
 
@@ -333,47 +349,72 @@ public sealed class IngestNewCdnContentJob(
         }
     }
 
-    private List<string> FindNewVersions(string fork, SqliteConnection con)
+    private (List<string> versionsToIngest, List<string> versionsToMakeAvailable) FindNewVersions(
+        string fork,
+        SqliteConnection con,
+        string clientZipName,
+        bool forceMakeAvailableForExisting,
+        bool isRobust)
     {
         using var stmtCheckVersion = con.Handle!.Prepare("SELECT 1 FROM ContentVersion WHERE Version = ?");
 
-        var newVersions = new List<(string, DateTime)>();
+        var versionsToIngest = new List<(string, DateTime)>();
+        var versionsToMakeAvailable = new List<(string, DateTime)>();
 
-        var dir = buildDirectoryManager.GetForkPath(fork);
+        var dir = isRobust ? buildDirectoryManager.GetRobustPath() : buildDirectoryManager.GetForkPath(fork);
         if (!Directory.Exists(dir))
-            return [];
+            return ([], []);
 
         foreach (var versionDirectory in Directory.EnumerateDirectories(dir))
         {
             var createdTime = Directory.GetLastWriteTime(versionDirectory);
             var version = Path.GetFileName(versionDirectory);
+            if (version.StartsWith(".", StringComparison.Ordinal))
+                continue;
 
             logger.LogTrace("Found version directory: {VersionDir}, write time: {WriteTime}", versionDirectory,
                 createdTime);
 
+            var hasAnyClientZip =
+                File.Exists(Path.Combine(versionDirectory, clientZipName + ".zip")) ||
+                Directory.EnumerateFiles(versionDirectory, clientZipName + "_*.zip").Any();
+
+            if (!hasAnyClientZip)
+            {
+                logger.LogWarning(
+                    "On-disk version is missing client zip: {Version} (expected {Exact} or {Prefix}_*.zip)",
+                    version,
+                    clientZipName + ".zip",
+                    clientZipName);
+                continue;
+            }
+
             stmtCheckVersion.Reset();
             stmtCheckVersion.BindString(1, version);
-
             if (stmtCheckVersion.Step() == raw.SQLITE_ROW)
             {
-                // Already have version, skip.
-                logger.LogTrace("Already have version: {Version}", version);
-                continue;
+                if (forceMakeAvailableForExisting)
+                {
+                    versionsToMakeAvailable.Add((version, createdTime));
+                    logger.LogTrace("Content DB already has version (will make available): {Version}", version);
+                }
+                else
+                {
+                    logger.LogTrace("Content DB already has version (skipping): {Version}", version);
+                }
             }
-
-            var clientZipName = manifestOptions.Value.Forks[fork].ClientZipName + ".zip";
-
-            if (!File.Exists(Path.Combine(versionDirectory, clientZipName)))
+            else
             {
-                logger.LogWarning("On-disk version is missing client zip: {Version}", version);
-                continue;
+                versionsToIngest.Add((version, createdTime));
+                versionsToMakeAvailable.Add((version, createdTime));
+                logger.LogTrace("Found new version to ingest: {Version}", version);
             }
-
-            newVersions.Add((version, createdTime));
-            logger.LogTrace("Found new version: {Version}", version);
         }
 
-        return newVersions.OrderByDescending(x => x.Item2).Select(x => x.Item1).ToList();
+        return (
+            versionsToIngest.OrderByDescending(x => x.Item2).Select(x => x.Item1).ToList(),
+            versionsToMakeAvailable.OrderByDescending(x => x.Item2).Select(x => x.Item1).ToList()
+        );
     }
 
     private static int EnsureForkCreated(string fork, SqliteConnection connection)

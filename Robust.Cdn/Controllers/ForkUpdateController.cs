@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc;
 using Quartz;
 using Robust.Cdn.Helpers;
 using Robust.Cdn.Jobs;

@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using Dapper;
 using Quartz;
 using Robust.Cdn.Helpers;
@@ -47,9 +47,16 @@ public sealed class MakeNewManifestVersionsAvailableJob(
         tx.Commit();
 
         var scheduler = await factory.GetScheduler();
-        await scheduler.TriggerJob(
-            UpdateForkManifestJob.Key,
-            UpdateForkManifestJob.Data(fork, notifyUpdate: true));
+        if (fork == UpdateRobustManifestJob.ForkName)
+        {
+            await scheduler.TriggerJob(UpdateRobustManifestJob.Key);
+        }
+        else
+        {
+            await scheduler.TriggerJob(
+                UpdateForkManifestJob.Key,
+                UpdateForkManifestJob.Data(fork, notifyUpdate: true));
+        }
     }
 
     private void MakeVersionsAvailable(int forkId, IEnumerable<string> versions)

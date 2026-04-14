@@ -1,4 +1,4 @@
-﻿using System.IO.Compression;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -37,6 +37,7 @@ namespace Robust.Cdn.Controllers;
 public sealed partial class ForkPublishController(
     ForkAuthHelper authHelper,
     IHttpClientFactory httpFactory,
+    Database cdnDatabase,
     ManifestDatabase manifestDatabase,
     ISchedulerFactory schedulerFactory,
     BaseUrlManager baseUrlManager,
@@ -49,6 +50,28 @@ public sealed partial class ForkPublishController(
     private static readonly Regex ValidFileRegex = ValidFileRegexBuilder();
 
     public const string PublishFetchHttpClient = "PublishFetch";
+
+    private void DeleteContentVersionIfExists(string fork, string version)
+    {
+        try
+        {
+            cdnDatabase.Connection.Execute(
+                """
+                DELETE FROM ContentVersion
+                WHERE Id IN (
+                    SELECT CV.Id
+                    FROM ContentVersion CV
+                    INNER JOIN Fork F ON F.Id = CV.ForkId
+                    WHERE F.Name = @Fork AND CV.Version = @Version
+                )
+                """,
+                new { Fork = fork, Version = version });
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning(e, "Failed to delete existing content version for fork {Fork} version {Version}", fork, version);
+        }
+    }
 
     private bool VersionAlreadyExists(string fork, string version)
     {
@@ -97,6 +120,18 @@ public sealed partial class ForkPublishController(
     {
         if (name == $"{forkConfig.ClientZipName}.zip")
             return new Artifact { Type = ArtifactType.Client };
+
+        var clientPrefix = $"{forkConfig.ClientZipName}_";
+        if (name.StartsWith(clientPrefix, StringComparison.Ordinal) && name.EndsWith(".zip", StringComparison.Ordinal))
+        {
+            var rid = name[clientPrefix.Length..^".zip".Length];
+            if (rid.Length == 0) return null;
+            return new Artifact
+            {
+                Type = ArtifactType.Client,
+                Platform = rid
+            };
+        }
 
         if (name.StartsWith(forkConfig.ServerZipName) && name.EndsWith(".zip"))
         {
@@ -185,7 +220,7 @@ public sealed partial class ForkPublishController(
         return HashHelper.HashBlake2B(stream);
     }
 
-    private void InjectBuildJsonIntoServers(Dictionary<Artifact, string> diskFiles, MemoryStream buildJson)
+    private void InjectBuildJsonIntoServers(Dictionary<Artifact, string> diskFiles, VersionMetadata metadata, string fork, Func<Artifact, Artifact> resolveClient)
     {
         logger.LogDebug("Adding build.json to server builds");
 
@@ -195,7 +230,7 @@ public sealed partial class ForkPublishController(
                 continue;
 
             logger.LogTrace("Adding build.json to build {ServerBuildFileName}", diskPath);
-
+            using var buildJson = GenerateBuildJson(diskFiles, resolveClient(artifact), metadata, fork);
             using var zipFile = System.IO.File.Open(diskPath, FileMode.Open);
             using var zip = new ZipArchive(zipFile, ZipArchiveMode.Update);
 
@@ -209,7 +244,6 @@ public sealed partial class ForkPublishController(
             using var entryStream = buildJsonEntry.Open();
 
             buildJson.CopyTo(entryStream);
-            buildJson.Position = 0;
         }
     }
 
@@ -227,9 +261,16 @@ public sealed partial class ForkPublishController(
 
         var (clientName, clientSha256, _) = GetFileNameSha256Pair(diskFiles[clientArtifact]);
 
-        var versionId = dbCon.QuerySingle<int>("""
-            INSERT INTO ForkVersion (Name, ForkId, PublishedTime, ClientFileName, ClientSha256, EngineVersion)
-            VALUES (@Name, @ForkId, @PublishTime, @ClientName, @ClientSha256, @EngineVersion)
+        var versionId = dbCon.QuerySingle<int>(
+            """
+            INSERT INTO ForkVersion (Name, ForkId, PublishedTime, ClientFileName, ClientSha256, EngineVersion, Available)
+            VALUES (@Name, @ForkId, @PublishTime, @ClientName, @ClientSha256, @EngineVersion, FALSE)
+            ON CONFLICT(ForkId, Name) DO UPDATE SET
+                PublishedTime = excluded.PublishedTime,
+                ClientFileName = excluded.ClientFileName,
+                ClientSha256 = excluded.ClientSha256,
+                EngineVersion = excluded.EngineVersion,
+                Available = FALSE
             RETURNING Id
             """,
             new
@@ -241,6 +282,10 @@ public sealed partial class ForkPublishController(
                 metadata.EngineVersion,
                 PublishTime = DateTime.UtcNow
             });
+
+        dbCon.Execute(
+            "DELETE FROM ForkVersionServerBuild WHERE ForkVersionId = @ForkVersionId",
+            new { ForkVersionId = versionId });
 
         foreach (var (artifact, diskPath) in diskFiles)
         {

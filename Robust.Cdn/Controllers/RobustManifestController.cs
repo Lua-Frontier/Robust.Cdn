@@ -1,34 +1,31 @@
-using System.Diagnostics.CodeAnalysis;
-using System.Net.Mime;
 using Dapper;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using Robust.Cdn.Config;
 using Robust.Cdn.Helpers;
+using Robust.Cdn.Jobs;
+using System.Diagnostics.CodeAnalysis;
+using System.Net.Mime;
 
 namespace Robust.Cdn.Controllers;
 
-/// <summary>
-/// Functionality for server manifests managed by the CDN.
-/// This covers the server build manifest as well as the download endpoint.
-/// </summary>
 [ApiController]
-[Route("/fork/{fork}")]
-public sealed class ForkManifestController(
+[Route("/robust")]
+public sealed class RobustManifestController(
     ManifestDatabase database,
     BuildDirectoryManager buildDirectoryManager,
-    IOptions<ManifestOptions> manifestOptions)
+    IOptions<RobustOptions> robustOptions)
     : ControllerBase
 {
     [HttpGet("manifest")]
-    public IActionResult GetManifest(string fork)
+    public IActionResult GetManifest()
     {
-        if (!TryCheckBasicAuth(fork, out var errorResult))
+        if (!TryCheckBasicAuth(out var errorResult))
             return errorResult;
 
         var rowId = database.Connection.QuerySingleOrDefault<long>(
             "SELECT ROWID FROM Fork WHERE Name == @Fork AND ServerManifestCache IS NOT NULL",
-            new { Fork = fork });
+            new { Fork = UpdateRobustManifestJob.ForkName });
 
         if (rowId == 0)
             return NotFound();
@@ -45,16 +42,12 @@ public sealed class ForkManifestController(
     }
 
     [HttpGet("version/{version}/file/{file}")]
-    public IActionResult GetFile(
-        string fork,
-        string version,
-        string file)
+    public IActionResult GetFile(string version, string file)
     {
-        // Just safety shit here.
         if (file.Contains('/') || file == ".." || file == ".")
             return BadRequest();
 
-        if (!TryCheckBasicAuth(fork, out var errorResult))
+        if (!TryCheckBasicAuth(out var errorResult))
             return errorResult;
 
         var versionExists = database.Connection.QuerySingleOrDefault<bool>("""
@@ -63,46 +56,29 @@ public sealed class ForkManifestController(
             WHERE ForkVersion.Name = @Version
               AND Fork.Name = @Fork
               AND Fork.Id = ForkVersion.ForkId
-            """, new { Fork = fork, Version = version });
+            """, new { Fork = UpdateRobustManifestJob.ForkName, Version = version });
 
         if (!versionExists)
             return NotFound();
 
-        var disk = buildDirectoryManager.GetBuildVersionFilePath(fork, version, file);
-
+        var disk = buildDirectoryManager.GetRobustBuildVersionFilePath(version, file);
         return PhysicalFile(disk, MediaTypeNames.Application.Zip);
     }
 
-    private bool TryCheckBasicAuth(
-        string fork,
-        [NotNullWhen(false)] out IActionResult? errorResult)
+    private bool TryCheckBasicAuth([NotNullWhen(false)] out IActionResult? errorResult)
     {
-        return TryCheckBasicAuth(HttpContext, manifestOptions.Value, fork, out errorResult);
-    }
-
-    internal static bool TryCheckBasicAuth(
-        HttpContext httpContext,
-        ManifestOptions manifestOptions,
-        string fork,
-        [NotNullWhen(false)] out IActionResult? errorResult)
-    {
-        if (!manifestOptions.Forks.TryGetValue(fork, out var forkConfig))
-        {
-            errorResult = new NotFoundObjectResult("Fork does not exist");
-            return false;
-        }
-
-        if (!forkConfig.Private)
+        var opts = robustOptions.Value;
+        if (!opts.Private)
         {
             errorResult = null;
             return true;
         }
-
         return AuthorizationUtility.CheckBasicAuth(
-            httpContext,
-            $"fork_{fork}",
-            a => forkConfig.PrivateUsers.GetValueOrDefault(a),
+            HttpContext,
+            "robust",
+            a => opts.PrivateUsers.GetValueOrDefault(a),
             out _,
             out errorResult);
     }
 }
+

@@ -18,6 +18,7 @@
     <PackageReference Include="Quartz.Extensions.Hosting" />
     <PackageReference Include="SpaceWizards.Sodium" />
     <PackageReference Include="SharpZstd.Interop" />
+    <PackageReference Include="SharpZstd" />
   </ItemGroup>
 
   <ItemGroup>

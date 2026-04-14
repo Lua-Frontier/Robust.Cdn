@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+using Dapper;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Options;
 using Quartz;
@@ -8,6 +8,7 @@ using Robust.Cdn.Controllers;
 using Robust.Cdn.Helpers;
 using Robust.Cdn.Jobs;
 using Robust.Cdn.Services;
+using System.Net.Http.Headers;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSystemd();
@@ -16,6 +17,8 @@ builder.Host.UseSystemd();
 
 builder.Services.Configure<CdnOptions>(builder.Configuration.GetSection(CdnOptions.Position));
 builder.Services.Configure<ManifestOptions>(builder.Configuration.GetSection(ManifestOptions.Position));
+builder.Services.Configure<LauncherOptions>(builder.Configuration.GetSection(LauncherOptions.Position));
+builder.Services.Configure<RobustOptions>(builder.Configuration.GetSection(RobustOptions.Position));
 
 builder.Services.AddControllersWithViews();
 builder.Services.AddScoped<BuildDirectoryManager>();
@@ -34,6 +37,7 @@ builder.Services.AddQuartz(q =>
     });
     q.AddJob<NotifyWatchdogUpdateJob>(j => j.WithIdentity(NotifyWatchdogUpdateJob.Key).StoreDurably());
     q.AddJob<UpdateForkManifestJob>(j => j.WithIdentity(UpdateForkManifestJob.Key).StoreDurably());
+    q.AddJob<UpdateRobustManifestJob>(j => j.WithIdentity(UpdateRobustManifestJob.Key).StoreDurably());
     q.ScheduleJob<PruneOldManifestBuilds>(trigger => trigger.WithSimpleSchedule(schedule =>
     {
         schedule.RepeatForever().WithIntervalInHours(24);
@@ -60,6 +64,8 @@ builder.Services.AddHttpClient(NotifyWatchdogUpdateJob.HttpClientName, c =>
 
 builder.Services.AddScoped<BaseUrlManager>();
 builder.Services.AddScoped<ForkAuthHelper>();
+builder.Services.AddScoped<LauncherAuthHelper>(); // like ctrl+c ctrl+v
+builder.Services.AddScoped<RobustAuthHelper>();
 builder.Services.AddHttpContextAccessor();
 
 /*
@@ -88,19 +94,28 @@ app.Lifetime.ApplicationStopped.Register(SqliteConnection.ClearAllPools);
     var logFactory = services.GetRequiredService<ILoggerFactory>();
     var loggerStartup = logFactory.CreateLogger("Robust.Cdn.Program");
     var manifestOptions = services.GetRequiredService<IOptions<ManifestOptions>>().Value;
+    var robustOptions = services.GetRequiredService<IOptions<RobustOptions>>().Value;
     var db = services.GetRequiredService<Database>();
     var manifestDb = services.GetRequiredService<ManifestDatabase>();
 
-    if (string.IsNullOrEmpty(manifestOptions.FileDiskPath))
+    var robustConfigured = !string.IsNullOrWhiteSpace(robustOptions.FileDiskPath);
+    var forksConfigured = manifestOptions.Forks.Count > 0;
+
+    if (!forksConfigured && !robustConfigured)
+    {
+        loggerStartup.LogCritical("No Manifest.Forks and no Robust configured!");
+        return 1;
+    }
+
+    if (forksConfigured && string.IsNullOrEmpty(manifestOptions.FileDiskPath))
     {
         loggerStartup.LogCritical("Manifest.FileDiskPath not set in configuration!");
         return 1;
     }
 
-    if (manifestOptions.Forks.Count == 0)
+    if (robustConfigured && string.IsNullOrEmpty(robustOptions.PublishToken))
     {
-        loggerStartup.LogCritical("No forks defined in Manifest configuration!");
-        return 1;
+        loggerStartup.LogWarning("Robust.PublishToken is not set; /robust/publish will not work.");
     }
 
     loggerStartup.LogDebug("Running migrations!");
@@ -115,6 +130,8 @@ app.Lifetime.ApplicationStopped.Register(SqliteConnection.ClearAllPools);
 
     loggerStartup.LogDebug("Ensuring forks created in manifest DB");
     manifestDb.EnsureForksCreated();
+    if (robustConfigured)
+        manifestDb.Connection.Execute("INSERT INTO Fork (Name) VALUES (@Name) ON CONFLICT DO NOTHING", new { Name = "robust" });
     loggerStartup.LogDebug("Done creating forks in manifest DB!");
 
     var scheduler = await initScope.ServiceProvider.GetRequiredService<ISchedulerFactory>().GetScheduler();
@@ -122,6 +139,8 @@ app.Lifetime.ApplicationStopped.Register(SqliteConnection.ClearAllPools);
     {
         await scheduler.TriggerJob(IngestNewCdnContentJob.Key, IngestNewCdnContentJob.Data(fork));
     }
+
+    if (robustConfigured) await scheduler.TriggerJob(IngestNewCdnContentJob.Key, IngestNewCdnContentJob.Data("robust"));
 }
 /*
 // Configure the HTTP request pipeline.
